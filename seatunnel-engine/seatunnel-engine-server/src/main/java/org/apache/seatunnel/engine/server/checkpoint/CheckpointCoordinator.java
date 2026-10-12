@@ -547,8 +547,12 @@ public class CheckpointCoordinator {
     @VisibleForTesting
     protected void scheduleTriggerPendingCheckpoint(
             CheckpointType checkpointType, long delayMills) {
+        long diagDue = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMills);
         scheduler.schedule(
-                () -> tryTriggerPendingCheckpoint(checkpointType),
+                () -> {
+                    DiagTriggerTrace.start(diagDue);
+                    tryTriggerPendingCheckpoint(checkpointType);
+                },
                 delayMills,
                 TimeUnit.MILLISECONDS);
     }
@@ -1048,6 +1052,7 @@ public class CheckpointCoordinator {
                     }
                 });
         pendingCounter.incrementAndGet();
+        DiagTriggerTrace.increment(jobId);
     }
 
     private CompletableFuture<PendingCheckpoint> createPendingCheckpoint(

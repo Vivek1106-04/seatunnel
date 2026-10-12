@@ -36,29 +36,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # With the warm-up fix: no JMH warmup at all, to show the score is flat from the start.
-          - { name: fix-j11-p1-trajectory, java: '11', dev: false, comp: true, jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 15' }
-          - { name: fix-j11-p10-trajectory, java: '11', dev: false, comp: true, jmh: '-p pipelineNum=10 -f 1 -wi 0 -i 15' }
-          - { name: fix-j17-p1-trajectory, java: '17', dev: false, comp: true, jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 15' }
-          - { name: fix-j17-p10-trajectory, java: '17', dev: false, comp: true, jmh: '-p pipelineNum=10 -f 1 -wi 0 -i 15' }
-          # Full sweep with the settings of tools/benchmarks/run_benchmarks.sh, before and after.
-          - { name: dev-j11-sweep, java: '11', dev: true, comp: false, jmh: '-f 3 -wi 3 -i 5' }
-          - { name: dev-j17-sweep, java: '17', dev: true, comp: false, jmh: '-f 3 -wi 3 -i 5' }
-          - { name: fix-j11-sweep, java: '11', dev: false, comp: false, jmh: '-f 3 -wi 3 -i 5' }
-          - { name: fix-j17-sweep, java: '17', dev: false, comp: false, jmh: '-f 3 -wi 3 -i 5' }
+          # Instrumented dev engine (DiagTriggerTrace): due / body start / pendingCounter per trigger.
+          - { name: tr-j17-p1, java: '17', comp: true, extra: '', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 30' }
+          - { name: tr-j17-p10, java: '17', comp: true, extra: '', jmh: '-p pipelineNum=10 -f 1 -wi 0 -i 30' }
+          - { name: tr-j11-p1, java: '11', comp: true, extra: '', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 30' }
+          # Causal JIT test: C1 only, no tier-3 profiling, no C2.
+          - { name: tr-j17-p1-c1only, java: '17', comp: true, extra: '-XX:TieredStopAtLevel=1', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 30' }
+          # Fork-to-fork offsets with CI settings.
+          - { name: tr-j17-p1-3f, java: '17', comp: false, extra: '', jmh: '-p pipelineNum=1 -f 3 -wi 3 -i 5' }
+          - { name: tr-j17-p500-3f, java: '17', comp: false, extra: '', jmh: '-p pipelineNum=500 -f 3 -wi 3 -i 5' }
     env:
-      # The benchmark's own fork options plus the compilation log; only used when comp is true.
-      FORK_JVM_ARGS: >-
+      BASE_JVM_ARGS: >-
         -Xms4g -Xmx4g -XX:+UseG1GC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC
-        -XX:ActiveProcessorCount=4 -Djava.net.preferIPv4Stack=true -XX:+PrintCompilation
+        -XX:ActiveProcessorCount=4 -Djava.net.preferIPv4Stack=true
     steps:
       - uses: actions/checkout@v4
-        if: ${{ !matrix.dev }}
-      - uses: actions/checkout@v4
-        if: ${{ matrix.dev }}
-        with:
-          repository: apache/seatunnel
-          ref: b3898b62d79db47d4b213c830da8745edd8fc678
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -72,11 +64,12 @@ jobs:
           { git rev-parse HEAD; uname -a; lscpu; nproc; free -h; java -version 2>&1; } | tee out/environment.txt
       - name: Run benchmark
         run: |
-          extra=()
-          if [[ "${{ matrix.comp }}" == "true" ]]; then extra=(-jvmArgsAppend "${FORK_JVM_ARGS}"); fi
-          echo "command: java -jar seatunnel-benchmarks/target/benchmarks.jar CheckpointSchedulingBenchmark ${{ matrix.jmh }} ${extra[*]} -foe true -rf json -rff out/result.json" | tee out/command.txt
+          mkdir -p out/trace
+          args="${BASE_JVM_ARGS} -Ddiag.trace.dir=${PWD}/out/trace ${{ matrix.extra }}"
+          if [[ "${{ matrix.comp }}" == "true" ]]; then args="${args} -XX:+PrintCompilation"; fi
+          echo "command: java -jar seatunnel-benchmarks/target/benchmarks.jar CheckpointSchedulingBenchmark ${{ matrix.jmh }} -jvmArgsAppend '${args}' -foe true -rf json -rff out/result.json" | tee out/command.txt
           java -jar seatunnel-benchmarks/target/benchmarks.jar CheckpointSchedulingBenchmark \
-            ${{ matrix.jmh }} "${extra[@]}" \
+            ${{ matrix.jmh }} -jvmArgsAppend "${args}" \
             -foe true -rf json -rff out/result.json 2>&1 | tee out/full.log \
             | grep -vE '^\s+[0-9]+\s+[0-9]+ ' || true
           # Compilation events of the trigger path, with the JVM uptime in ms in the first column.
