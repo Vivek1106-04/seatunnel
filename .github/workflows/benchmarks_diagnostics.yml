@@ -15,239 +15,60 @@
 # limitations under the License.
 #
 
-name: Benchmarks Diagnostics
+# Throwaway diagnostic workflow for the CheckpointSchedulingBenchmark warmup question on
+# apache/seatunnel#12418. Lives only on the fork branch bench-diag-12418; never proposed upstream.
+# It replaces benchmarks_diagnostics.yml on that branch so the fork's already registered
+# workflow can be dispatched with --ref bench-diag-12418.
+name: Bench diag 12418
 
 on:
   workflow_dispatch:
-    inputs:
-      seatunnel_ref:
-        description: 'SeaTunnel branch, tag, or commit SHA to diagnose.'
-        required: false
-        type: string
-        default: 'dev'
-      pr_number:
-        description: 'Optional trusted PR to diagnose. The workflow executes its code.'
-        required: false
-        type: string
-      benchmark:
-        description: 'One exact JMH benchmark method; multi-match selectors are rejected.'
-        required: true
-        type: string
-        default: 'IntermediateQueueBenchmark.disruptorRecordHandoff$'
-      java_version:
-        description: 'JDK used by the diagnostic run.'
-        required: true
-        type: choice
-        options:
-          - '8'
-          - '11'
-        default: '8'
-      profile:
-        description: 'Profiler mode. all runs CPU, wall-clock, lock, and GC separately.'
-        required: true
-        type: choice
-        options:
-          - 'cpu'
-          - 'wall'
-          - 'lock'
-          - 'gc'
-          - 'all'
-        default: 'cpu'
-      capture_jfr:
-        description: 'Also capture a JFR recording for offline JVM analysis.'
-        required: true
-        type: boolean
-        default: false
-      jmh_args:
-        description: 'Optional JMH args, for example: -wi 1 -i 1 -w 1s -r 1s. Forks are fixed at 1.'
-        required: false
-        type: string
 
 permissions:
   contents: read
 
 jobs:
-  diagnostics:
-    name: Capture diagnostics with Java ${{ inputs.java_version }}
+  diag:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
-
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: j11-p1-trajectory, java: '11', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 30 -prof comp' }
+          - { name: j11-p10-trajectory, java: '11', jmh: '-p pipelineNum=10 -f 1 -wi 0 -i 30 -prof comp' }
+          - { name: j17-p1-trajectory, java: '17', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 30 -prof comp' }
+          - { name: j17-p10-trajectory, java: '17', jmh: '-p pipelineNum=10 -f 1 -wi 0 -i 30 -prof comp' }
     env:
-      ASYNC_PROFILER_CPU_EVENT: 'ctimer'
-      ASYNC_PROFILER_VERSION: '4.5'
-      ASYNC_PROFILER_SHA256: '89546fbb9ee0fc5496c7edd4099b0709489bc78b0d8057ccbb4b801f6b032b62'
-      BENCHMARKS: ${{ inputs.benchmark }}
-      JAVA_VERSION: ${{ inputs.java_version }}
-      PROFILE_JMH_ARGS: ${{ inputs.jmh_args || '' }}
-      PR_NUMBER: ${{ inputs.pr_number || '' }}
-      SEATUNNEL_REF: ${{ inputs.seatunnel_ref || 'dev' }}
-      TARGET_DIRECTORY: target
+      FORK_JVM_ARGS: >-
+        -Xms4g -Xmx4g -XX:+UseG1GC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC
+        -XX:ActiveProcessorCount=4 -Djava.net.preferIPv4Stack=true -XX:+PrintCompilation
     steps:
-      - name: Checkout benchmark target
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || inputs.seatunnel_ref || 'dev' }}
-          path: target
-
-      - name: Checkout workflow tools
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: workflow-source
-          sparse-checkout: tools/benchmarks
-
-      - name: Set up JDK ${{ inputs.java_version }} with Maven cache
-        if: inputs.pr_number == ''
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ inputs.java_version }}
+          java-version: ${{ matrix.java }}
           cache: maven
-
-      - name: Set up JDK ${{ inputs.java_version }} without Maven cache
-        if: inputs.pr_number != ''
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ inputs.java_version }}
-
       - name: Build benchmark module
-        id: build_benchmark
-        working-directory: target
-        run: ./mvnw -Pbenchmark -pl seatunnel-benchmarks -am -DskipTests package
-
-      - name: Install async-profiler
-        id: install_async_profiler
-        if: >-
-          steps.build_benchmark.outcome == 'success' &&
-          (inputs.profile == 'cpu' ||
-          inputs.profile == 'wall' ||
-          inputs.profile == 'lock' ||
-          inputs.profile == 'all')
+        run: ./mvnw -B -q -Pbenchmark -pl seatunnel-benchmarks -am -DskipTests -Dskip.spotless=true package
+      - name: Environment
         run: |
-          archive="${RUNNER_TEMP}/async-profiler.tar.gz"
-          install_directory="${RUNNER_TEMP}/async-profiler"
-          curl --fail --location --retry 5 --retry-all-errors \
-            --output "${archive}" \
-            "https://github.com/async-profiler/async-profiler/releases/download/v${ASYNC_PROFILER_VERSION}/async-profiler-${ASYNC_PROFILER_VERSION}-linux-x64.tar.gz"
-          echo "${ASYNC_PROFILER_SHA256}  ${archive}" | sha256sum --check --strict
-          mkdir -p "${install_directory}"
-          tar --extract --gzip --file "${archive}" --directory "${install_directory}" --strip-components=1
-          echo "ASYNC_PROFILER_HOME=${install_directory}" >> "${GITHUB_ENV}"
-
-      - name: Profile CPU
-        if: >-
-          always() &&
-          steps.build_benchmark.outcome == 'success' &&
-          steps.install_async_profiler.outcome == 'success' &&
-          (inputs.profile == 'cpu' || inputs.profile == 'all')
+          mkdir -p out
+          { uname -a; lscpu; nproc; free -h; java -version 2>&1; } | tee out/environment.txt
+      - name: Run benchmark
         run: |
-          bash workflow-source/tools/benchmarks/profile_benchmarks.sh profile cpu \
-            --repository "${TARGET_DIRECTORY}" \
-            --output "${GITHUB_WORKSPACE}/benchmark-diagnostics/profile-cpu"
-
-      - name: Profile wall clock
-        if: >-
-          always() &&
-          steps.build_benchmark.outcome == 'success' &&
-          steps.install_async_profiler.outcome == 'success' &&
-          (inputs.profile == 'wall' || inputs.profile == 'all')
-        run: |
-          bash workflow-source/tools/benchmarks/profile_benchmarks.sh profile wall \
-            --repository "${TARGET_DIRECTORY}" \
-            --output "${GITHUB_WORKSPACE}/benchmark-diagnostics/profile-wall"
-
-      - name: Profile locks
-        if: >-
-          always() &&
-          steps.build_benchmark.outcome == 'success' &&
-          steps.install_async_profiler.outcome == 'success' &&
-          (inputs.profile == 'lock' || inputs.profile == 'all')
-        run: |
-          bash workflow-source/tools/benchmarks/profile_benchmarks.sh profile lock \
-            --repository "${TARGET_DIRECTORY}" \
-            --output "${GITHUB_WORKSPACE}/benchmark-diagnostics/profile-lock"
-
-      - name: Profile GC and allocation
-        if: >-
-          always() &&
-          steps.build_benchmark.outcome == 'success' &&
-          (inputs.profile == 'gc' || inputs.profile == 'all')
-        run: |
-          bash workflow-source/tools/benchmarks/profile_benchmarks.sh profile gc \
-            --repository "${TARGET_DIRECTORY}" \
-            --output "${GITHUB_WORKSPACE}/benchmark-diagnostics/profile-gc"
-
-      - name: Capture JFR
-        if: >-
-          always() &&
-          steps.build_benchmark.outcome == 'success' &&
-          inputs.capture_jfr
-        run: |
-          bash workflow-source/tools/benchmarks/profile_benchmarks.sh capture jfr \
-            --repository "${TARGET_DIRECTORY}" \
-            --output "${GITHUB_WORKSPACE}/benchmark-diagnostics/capture-jfr"
-
-      - name: Upload CPU profile
-        if: always() && (inputs.profile == 'cpu' || inputs.profile == 'all')
-        uses: actions/upload-artifact@v4
-        with:
-          name: seatunnel-benchmark-profile-cpu-java${{ env.JAVA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 30
-          if-no-files-found: warn
-          path: benchmark-diagnostics/profile-cpu/**
-
-      - name: Upload wall-clock profile
-        if: always() && (inputs.profile == 'wall' || inputs.profile == 'all')
-        uses: actions/upload-artifact@v4
-        with:
-          name: seatunnel-benchmark-profile-wall-java${{ env.JAVA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 30
-          if-no-files-found: warn
-          path: benchmark-diagnostics/profile-wall/**
-
-      - name: Upload lock profile
-        if: always() && (inputs.profile == 'lock' || inputs.profile == 'all')
-        uses: actions/upload-artifact@v4
-        with:
-          name: seatunnel-benchmark-profile-lock-java${{ env.JAVA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 30
-          if-no-files-found: warn
-          path: benchmark-diagnostics/profile-lock/**
-
-      - name: Upload GC profile
-        if: always() && (inputs.profile == 'gc' || inputs.profile == 'all')
-        uses: actions/upload-artifact@v4
-        with:
-          name: seatunnel-benchmark-profile-gc-java${{ env.JAVA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 30
-          if-no-files-found: warn
-          path: benchmark-diagnostics/profile-gc/**
-
-      - name: Upload JFR capture
-        if: always() && inputs.capture_jfr
-        uses: actions/upload-artifact@v4
-        with:
-          name: seatunnel-benchmark-capture-jfr-java${{ env.JAVA_VERSION }}-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 30
-          if-no-files-found: warn
-          path: benchmark-diagnostics/capture-jfr/**
-
-      - name: Publish diagnostic summary
+          java -jar seatunnel-benchmarks/target/benchmarks.jar CheckpointSchedulingBenchmark \
+            ${{ matrix.jmh }} -jvmArgsAppend "${FORK_JVM_ARGS}" \
+            -foe true -rf json -rff out/result.json 2>&1 | tee out/full.log \
+            | grep -vE '^\s+[0-9]+\s+[0-9]+ ' || true
+          # Compilation events of the trigger path, with the JVM uptime in ms in the first column.
+          grep -E 'checkpoint\.CheckpointCoordinator|ScheduledThreadPoolExecutor|SharedCheckpointScheduler|CheckpointSchedulingFixture' \
+            out/full.log > out/compilation-trigger-path.txt || true
+          gzip out/full.log
+      - uses: actions/upload-artifact@v4
         if: always()
-        run: |
-          python3 workflow-source/tools/benchmarks/profile_report.py summary \
-            --diagnostics-dir benchmark-diagnostics \
-            --profile "${{ inputs.profile }}" \
-            --capture-jfr "${{ inputs.capture_jfr }}" \
-            --repository "${TARGET_DIRECTORY}" \
-            --ref "${SEATUNNEL_REF}" \
-            --pr-number "${PR_NUMBER}" \
-            --benchmark "${BENCHMARKS}" \
-            --java "${JAVA_VERSION}" \
-            --jmh-args "${PROFILE_JMH_ARGS}" \
-            --artifacts-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}#artifacts" \
-            --run-id "${GITHUB_RUN_ID}" \
-            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            >> "${GITHUB_STEP_SUMMARY}"
+        with:
+          name: ${{ matrix.name }}
+          path: out/**
