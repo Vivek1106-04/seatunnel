@@ -78,8 +78,8 @@ import java.util.concurrent.TimeUnit;
  * after a twentieth of the invocations; lower values compile so much at once that triggers come due
  * unmeasured and the skip limit fails the run. And each trial first lets its coordinators trigger
  * {@link #TRIGGER_PATH_WARMUP_TRIGGERS} checkpoints, a warmup counted in triggers rather than
- * seconds, so the lowest trigger rate gets the same compiled code as the others: about 20 seconds
- * at ten pipelines or more, and about 200 at one.
+ * seconds, so the lowest trigger rate gets the same compiled code as the others, and runs for at
+ * least {@link #MIN_WARMUP_SECONDS}: about 200 seconds at one pipeline, 60 at ten or more.
  */
 @BenchmarkMode(Mode.SampleTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
@@ -114,6 +114,13 @@ public class CheckpointSchedulingBenchmark extends BenchmarkBase {
      * scheduled task stopped changing tier after about 1,000 triggers on GitHub's Linux runners.
      */
     static final long TRIGGER_PATH_WARMUP_TRIGGERS = 1_000L;
+
+    /**
+     * Least time each trial runs its coordinators before JMH's own warmup. At ten pipelines or more
+     * the trigger count above is reached in 20 seconds, while the rest of the member is still
+     * compiling, and the first measured iteration then caught millisecond outliers.
+     */
+    static final long MIN_WARMUP_SECONDS = 60L;
 
     public static void main(String[] args) throws RunnerException {
         Options options =
@@ -152,7 +159,8 @@ public class CheckpointSchedulingBenchmark extends BenchmarkBase {
                             Math.max(
                                     MIN_MEASURABLE_INTERVAL_MILLIS,
                                     pipelineNum * triggerSpacingMillis),
-                            TRIGGER_PATH_WARMUP_TRIGGERS);
+                            TRIGGER_PATH_WARMUP_TRIGGERS,
+                            TimeUnit.SECONDS.toMillis(MIN_WARMUP_SECONDS));
             fixture.setUp();
             System.out.printf(
                     "# checkpoint scheduler threads for %d pipelines: %d; measuring %d of them%n",

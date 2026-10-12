@@ -134,6 +134,7 @@ public final class CheckpointSchedulingFixture {
     private final long intervalMillis;
     private final long intervalNanos;
     private final long warmupTriggers;
+    private final long minWarmupNanos;
     private final AtomicLong triggeredCheckpoints = new AtomicLong();
     private int probeStride;
     private Set<Thread> preexistingSchedulerThreads = Collections.emptySet();
@@ -159,26 +160,29 @@ public final class CheckpointSchedulingFixture {
      * @param intervalMillis checkpoint interval of every job
      */
     public CheckpointSchedulingFixture(int pipelineNum, long intervalMillis) {
-        this(pipelineNum, intervalMillis, 0L);
+        this(pipelineNum, intervalMillis, 0L, 0L);
     }
 
     /**
      * @param pipelineNum number of jobs, each with one single-task pipeline
      * @param intervalMillis checkpoint interval of every job
      * @param warmupTriggers checkpoints the coordinators trigger before setup returns, 0 for none
+     * @param minWarmupMillis least time the coordinators run before setup returns, 0 for none
      */
-    public CheckpointSchedulingFixture(int pipelineNum, long intervalMillis, long warmupTriggers) {
+    public CheckpointSchedulingFixture(
+            int pipelineNum, long intervalMillis, long warmupTriggers, long minWarmupMillis) {
         this.pipelineNum = pipelineNum;
         this.intervalMillis = intervalMillis;
         this.intervalNanos = TimeUnit.MILLISECONDS.toNanos(intervalMillis);
         this.warmupTriggers = warmupTriggers;
+        this.minWarmupNanos = TimeUnit.MILLISECONDS.toNanos(minWarmupMillis);
     }
 
     /**
      * Starts the member, creates the coordinators and starts their pipelines staggered across one
      * interval, so due triggers arrive as a steady stream rather than a burst. Then lets them
-     * trigger {@code warmupTriggers} checkpoints, and returns once every coordinator's trigger
-     * phase is known.
+     * trigger {@code warmupTriggers} checkpoints for at least {@code minWarmupMillis}, and returns
+     * once every coordinator's trigger phase is known.
      */
     public void setUp() throws Exception {
         validateParameters();
@@ -203,17 +207,19 @@ public final class CheckpointSchedulingFixture {
      * a warmup counted in triggers gives every pipeline count the same compiled code to measure,
      * where a warmup counted in seconds gives the lowest trigger rates the least. Nothing is
      * measured meanwhile, and the coordinators are the measured ones, so no code path is exercised
-     * that the measurement does not also take.
+     * that the measurement does not also take. The minimum time covers the rest of the member,
+     * whose compilation goes on for a while after the trigger path settles at the higher rates.
      */
     private void awaitWarmupTriggers() {
+        long start = System.nanoTime();
         long target = triggeredCheckpoints.get() + warmupTriggers;
+        long earliestEnd = start + minWarmupNanos;
         // Twice the time the triggers take at the configured rate, plus the pending re-arms.
         long deadline =
-                System.nanoTime()
-                        + 2 * warmupTriggers * intervalNanos / pipelineNum
+                Math.max(earliestEnd, start + 2 * warmupTriggers * intervalNanos / pipelineNum)
                         + RESYNC_INTERVALS * intervalNanos
                         + PENDING_REARM_NANOS;
-        while (triggeredCheckpoints.get() < target) {
+        while (triggeredCheckpoints.get() < target || System.nanoTime() < earliestEnd) {
             checkFailure();
             if (System.nanoTime() > deadline) {
                 throw new IllegalStateException(
