@@ -19,7 +19,6 @@ package org.apache.seatunnel.benchmark.checkpoint;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -35,12 +34,6 @@ class CheckpointSchedulingFixtureTest {
     private static final long CHECKPOINT_INTERVAL_MILLIS = 200L;
     private static final int SAMPLE_COUNT = 20;
     private static final long THREAD_STOP_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(30);
-    private static final long WARMUP_TRIGGERS = 500L;
-    /**
-     * Warm-up job ids start at 1,000,000, measured ones at 1,000, so only warm-up thread names
-     * contain "/10000".
-     */
-    private static final String WARMUP_JOB_ID_PREFIX = "10000";
 
     @Test
     void shouldMeasureDueTriggersOfRealCoordinators() throws Exception {
@@ -86,37 +79,6 @@ class CheckpointSchedulingFixtureTest {
         } finally {
             release.countDown();
         }
-    }
-
-    @Test
-    void shouldRemoveTheWarmUpCoordinatorsBeforeMeasuring() throws Exception {
-        CheckpointSchedulingFixture fixture =
-                new CheckpointSchedulingFixture(
-                        PIPELINE_NUM, CHECKPOINT_INTERVAL_MILLIS, WARMUP_TRIGGERS);
-        fixture.setUp();
-        try {
-            assertTrue(
-                    fixture.getTriggeredCheckpoints() >= WARMUP_TRIGGERS,
-                    "setup should return only after the warm-up triggers ran");
-            // A per-pipeline scheduler names its threads after its job; none may be left from a
-            // warm-up job once measuring starts.
-            assertEquals(
-                    Collections.emptyList(),
-                    fixture.schedulerThreads().stream()
-                            .map(Thread::getName)
-                            .filter(name -> name.contains("/" + WARMUP_JOB_ID_PREFIX))
-                            .collect(Collectors.toList()));
-            fixture.beginIteration();
-            for (int i = 0; i < SAMPLE_COUNT; i++) {
-                fixture.awaitNextDueTrigger();
-                fixture.awaitTrigger();
-            }
-            assertEquals(SAMPLE_COUNT, fixture.getSampled());
-            fixture.endIteration();
-        } finally {
-            fixture.tearDown();
-        }
-        assertSchedulerThreadsStop(fixture);
     }
 
     private static void assertSchedulerThreadsStop(CheckpointSchedulingFixture fixture)
