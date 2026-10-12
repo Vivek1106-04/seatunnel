@@ -41,6 +41,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Collectors;
@@ -127,9 +128,30 @@ public final class CheckpointSchedulingFixture {
     private static final long EXECUTOR_KEEP_ALIVE_SECONDS = 60L;
     private static final long SHUTDOWN_TIMEOUT_SECONDS = 30L;
 
+    /**
+     * Shape of the throwaway coordinators that warm up the trigger path: 100 jobs at a 200 ms
+     * interval trigger about 500 checkpoints a second, ten times the rate of any measured point.
+     * Their job ids are far above the measured ones.
+     */
+    private static final int WARMUP_PIPELINES = 100;
+
+    private static final long WARMUP_INTERVAL_MILLIS = 200L;
+    private static final long WARMUP_FIRST_JOB_ID = 1_000_000L;
+    private static final long WARMUP_TIMEOUT_NANOS = TimeUnit.MINUTES.toNanos(2);
+    private static final long WARMUP_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
+
+    /**
+     * How long teardown of the warm-up coordinators waits for scheduler threads they started to
+     * exit. A per-pipeline scheduler's threads exit once its coordinator is cancelled; a shared
+     * scheduler's threads stay, and the measured coordinators then use them, so they are counted.
+     */
+    private static final long WARMUP_THREAD_EXIT_NANOS = TimeUnit.SECONDS.toNanos(2);
+
     private final int pipelineNum;
     private final long intervalMillis;
     private final long intervalNanos;
+    private final long warmupTriggers;
+    private final AtomicLong triggeredCheckpoints = new AtomicLong();
     private int probeStride;
     private Set<Thread> preexistingSchedulerThreads = Collections.emptySet();
 
@@ -154,15 +176,26 @@ public final class CheckpointSchedulingFixture {
      * @param intervalMillis checkpoint interval of every job
      */
     public CheckpointSchedulingFixture(int pipelineNum, long intervalMillis) {
-        this.pipelineNum = pipelineNum;
-        this.intervalMillis = intervalMillis;
-        this.intervalNanos = TimeUnit.MILLISECONDS.toNanos(intervalMillis);
+        this(pipelineNum, intervalMillis, 0L);
     }
 
     /**
-     * Starts the member, creates the coordinators and starts their pipelines staggered across one
-     * interval, so due triggers arrive as a steady stream rather than a burst. Returns once every
-     * coordinator's trigger phase is known.
+     * @param pipelineNum number of jobs, each with one single-task pipeline
+     * @param intervalMillis checkpoint interval of every job
+     * @param warmupTriggers checkpoints to trigger on throwaway coordinators before the measured
+     *     ones are created, 0 for none; see {@link #warmUpTriggerPath}
+     */
+    public CheckpointSchedulingFixture(int pipelineNum, long intervalMillis, long warmupTriggers) {
+        this.pipelineNum = pipelineNum;
+        this.intervalMillis = intervalMillis;
+        this.intervalNanos = TimeUnit.MILLISECONDS.toNanos(intervalMillis);
+        this.warmupTriggers = warmupTriggers;
+    }
+
+    /**
+     * Starts the member, warms up the trigger path, creates the coordinators and starts their
+     * pipelines staggered across one interval, so due triggers arrive as a steady stream rather
+     * than a burst. Returns once every coordinator's trigger phase is known.
      */
     public void setUp() throws Exception {
         validateParameters();
@@ -173,8 +206,24 @@ public final class CheckpointSchedulingFixture {
         SeaTunnelServer server = environment.getServer();
         EngineConfig engineConfig = server.getSeaTunnelConfig().getEngineConfig();
         coordinatorExecutor = createCoordinatorExecutor(engineConfig);
-        createManagers(server, engineConfig.getCheckpointConfig());
-        startStaggered();
+        warmUpTriggerPath(server, engineConfig);
+        managers.addAll(
+                createManagers(
+                        server,
+                        engineConfig.getCheckpointConfig(),
+                        coordinatorExecutor,
+                        failure,
+                        FIRST_JOB_ID,
+                        pipelineNum,
+                        intervalMillis));
+        pendingCounters = new AtomicInteger[pipelineNum];
+        lastTriggerNanos = new long[pipelineNum];
+        for (int i = 0; i < pipelineNum; i++) {
+            pendingCounters[i] =
+                    readPendingCounter(managers.get(i).getCheckpointCoordinator(PIPELINE_ID));
+            lastTriggerNanos[i] = NOT_SYNCED;
+        }
+        startStaggered(managers, intervalNanos);
         // Every coordinator, not only the probes: once each has triggered, each has armed its
         // scheduler, so countSchedulerThreads() sees the full thread cost of pipelineNum pipelines.
         resync(1);
@@ -345,6 +394,10 @@ public final class CheckpointSchedulingFixture {
         return sampled;
     }
 
+    long getTriggeredCheckpoints() {
+        return triggeredCheckpoints.get();
+    }
+
     /**
      * Counts this fixture's live checkpoint scheduler threads. This is the cost a shared scheduler
      * exists to remove, so it is reported rather than derived.
@@ -370,41 +423,127 @@ public final class CheckpointSchedulingFixture {
                 .collect(Collectors.toList());
     }
 
-    private void createManagers(SeaTunnelServer server, CheckpointConfig memberConfig) {
+    /**
+     * Runs the production trigger path hot before anything is measured, then removes the
+     * coordinators that did it.
+     *
+     * <p>The JIT compiles the trigger path by how often it runs, not by how long the benchmark has
+     * been running. Measured points trigger 5 to 50 checkpoints a second, so on its own the path
+     * takes minutes to reach fully optimised code, and at one pipeline it does not get there within
+     * a whole trial: the score then trends down through every measured iteration. Throwaway
+     * coordinators on the same member trigger {@code warmupTriggers} checkpoints first, at the same
+     * rate for every point of the sweep, so every point starts measuring on the same compiled code.
+     * Their job ids, scheduler threads and pending checkpoints are gone before the measured
+     * coordinators are created.
+     *
+     * <p>They are stopped the way {@link #tearDown} stops the measured ones, executor first, so a
+     * checkpoint still starting cannot arm its timeout on the scheduler that cancelling replaces,
+     * which would leave that thread running. They have their own executor for that, and their own
+     * failure sink: stopping the executor under a running coordinator can fail its checkpoint,
+     * which is expected then and must not fail the trial.
+     */
+    private void warmUpTriggerPath(SeaTunnelServer server, EngineConfig engineConfig)
+            throws InterruptedException {
+        if (warmupTriggers == 0) {
+            return;
+        }
+        ThreadPoolExecutor warmupExecutor = createCoordinatorExecutor(engineConfig);
+        AtomicReference<Throwable> warmupFailure = new AtomicReference<>();
+        List<FakeTaskCheckpointManager> warmup =
+                createManagers(
+                        server,
+                        engineConfig.getCheckpointConfig(),
+                        warmupExecutor,
+                        warmupFailure,
+                        WARMUP_FIRST_JOB_ID,
+                        WARMUP_PIPELINES,
+                        WARMUP_INTERVAL_MILLIS);
+        long target = triggeredCheckpoints.get() + warmupTriggers;
+        long deadline = System.nanoTime() + WARMUP_TIMEOUT_NANOS;
+        try {
+            startStaggered(warmup, TimeUnit.MILLISECONDS.toNanos(WARMUP_INTERVAL_MILLIS));
+            while (triggeredCheckpoints.get() < target) {
+                Throwable throwable = warmupFailure.get();
+                if (throwable != null) {
+                    throw new IllegalStateException(
+                            "Checkpoint coordinator failed during warm-up", throwable);
+                }
+                if (System.nanoTime() > deadline) {
+                    throw new IllegalStateException(
+                            "Warm-up triggered "
+                                    + (triggeredCheckpoints.get() + warmupTriggers - target)
+                                    + " of "
+                                    + warmupTriggers
+                                    + " checkpoints within "
+                                    + TimeUnit.NANOSECONDS.toSeconds(WARMUP_TIMEOUT_NANOS)
+                                    + " s");
+                }
+                parkUntil(System.nanoTime() + WARMUP_POLL_NANOS);
+            }
+        } finally {
+            warmupExecutor.shutdownNow();
+            if (!warmupExecutor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Warm-up coordinator executor did not stop");
+            }
+            for (FakeTaskCheckpointManager manager : warmup) {
+                manager.cancelCheckpoint(PIPELINE_ID);
+            }
+        }
+        awaitWarmupSchedulerThreadsExit();
+    }
+
+    private void awaitWarmupSchedulerThreadsExit() throws InterruptedException {
+        long deadline = System.nanoTime() + WARMUP_THREAD_EXIT_NANOS;
+        for (Thread thread : schedulerThreads()) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                return;
+            }
+            TimeUnit.NANOSECONDS.timedJoin(thread, remaining);
+        }
+    }
+
+    private List<FakeTaskCheckpointManager> createManagers(
+            SeaTunnelServer server,
+            CheckpointConfig memberConfig,
+            ThreadPoolExecutor executor,
+            AtomicReference<Throwable> failureSink,
+            long firstJobId,
+            int count,
+            long jobIntervalMillis) {
         NodeEngine nodeEngine = server.getNodeEngine();
         IMap<Object, Object> runningJobState =
                 nodeEngine.getHazelcastInstance().getMap(Constant.IMAP_RUNNING_JOB_STATE);
         CheckpointConfig jobConfig = new CheckpointConfig();
-        jobConfig.setCheckpointInterval(intervalMillis);
+        jobConfig.setCheckpointInterval(jobIntervalMillis);
         jobConfig.setStorage(memberConfig.getStorage());
 
-        pendingCounters = new AtomicInteger[pipelineNum];
-        lastTriggerNanos = new long[pipelineNum];
-        for (int i = 0; i < pipelineNum; i++) {
-            long jobId = FIRST_JOB_ID + i;
-            FakeTaskCheckpointManager manager =
+        List<FakeTaskCheckpointManager> created = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            long jobId = firstJobId + i;
+            created.add(
                     new FakeTaskCheckpointManager(
                             jobId,
                             nodeEngine,
                             singleTaskPlan(jobId),
                             jobConfig,
                             server.getCheckpointService().getCheckpointStorage(),
-                            coordinatorExecutor,
+                            executor,
                             runningJobState,
                             server.getEngineContext(),
                             server.getCheckpointMonitorService(),
-                            failure);
-            managers.add(manager);
-            pendingCounters[i] = readPendingCounter(manager.getCheckpointCoordinator(PIPELINE_ID));
-            lastTriggerNanos[i] = NOT_SYNCED;
+                            failureSink,
+                            triggeredCheckpoints));
         }
+        return created;
     }
 
-    private void startStaggered() {
+    private static void startStaggered(
+            List<FakeTaskCheckpointManager> toStart, long staggerIntervalNanos) {
         long start = System.nanoTime();
-        for (int i = 0; i < pipelineNum; i++) {
-            parkUntil(start + intervalNanos * i / pipelineNum);
-            managers.get(i).startTask();
+        for (int i = 0; i < toStart.size(); i++) {
+            parkUntil(start + staggerIntervalNanos * i / toStart.size());
+            toStart.get(i).startTask();
         }
     }
 

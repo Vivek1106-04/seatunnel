@@ -60,9 +60,15 @@ import java.util.concurrent.TimeUnit;
  * <p>The checkpoint interval is {@code pipelineNum * triggerSpacingMillis}, so every point of the
  * sweep sees the same rate of due triggers and the same checkpoint load on storage, and only the
  * number of coordinators changes. It is floored at {@link #MIN_MEASURABLE_INTERVAL_MILLIS}, so the
- * smallest pipeline counts sample less often. Each job has one pipeline: many jobs is what "many
- * active pipelines" means on a member, and it keeps per-job checkpoint state from becoming the
- * bottleneck.
+ * smallest pipeline counts sample less often, and also trigger less often: one pipeline triggers 5
+ * checkpoints a second where every other point triggers 50. Each job has one pipeline: many jobs is
+ * what "many active pipelines" means on a member, and it keeps per-job checkpoint state from
+ * becoming the bottleneck.
+ *
+ * <p>Because the JIT compiles the trigger path by how often it runs, time-based JMH warmup leaves
+ * the low-rate points measuring code that is still being compiled. Each trial therefore first
+ * triggers {@link #TRIGGER_PATH_WARMUP_TRIGGERS} checkpoints on throwaway coordinators, see {@link
+ * CheckpointSchedulingFixture}.
  */
 @BenchmarkMode(Mode.SampleTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
@@ -89,6 +95,15 @@ public class CheckpointSchedulingBenchmark extends BenchmarkBase {
      * the lowest interval SeaTunnel accepts, which the fixture enforces separately.
      */
     static final long MIN_MEASURABLE_INTERVAL_MILLIS = 200L;
+
+    /**
+     * Checkpoints triggered on throwaway coordinators before each trial, so the trigger path is
+     * fully compiled before the first measured iteration at every point of the sweep. Without it,
+     * on GitHub's Linux runners with JDK 17, the trigger path reached C2 only after 110 to 130 s
+     * (about 6,000 triggers) at 10 pipelines, and not within 300 s at one pipeline, so the
+     * one-pipeline score kept falling through every measured iteration.
+     */
+    static final long TRIGGER_PATH_WARMUP_TRIGGERS = 10_000L;
 
     public static void main(String[] args) throws RunnerException {
         Options options =
@@ -126,7 +141,8 @@ public class CheckpointSchedulingBenchmark extends BenchmarkBase {
                             pipelineNum,
                             Math.max(
                                     MIN_MEASURABLE_INTERVAL_MILLIS,
-                                    pipelineNum * triggerSpacingMillis));
+                                    pipelineNum * triggerSpacingMillis),
+                            TRIGGER_PATH_WARMUP_TRIGGERS);
             fixture.setUp();
             System.out.printf(
                     "# checkpoint scheduler threads for %d pipelines: %d; measuring %d of them%n",
