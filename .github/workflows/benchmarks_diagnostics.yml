@@ -36,15 +36,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Instrumented dev engine (DiagTriggerTrace): due / body start / pendingCounter per trigger.
-          - { name: tr-j17-p1, java: '17', comp: true, extra: '', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 30' }
-          - { name: tr-j17-p10, java: '17', comp: true, extra: '', jmh: '-p pipelineNum=10 -f 1 -wi 0 -i 30' }
-          - { name: tr-j11-p1, java: '11', comp: true, extra: '', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 30' }
-          # Causal JIT test: C1 only, no tier-3 profiling, no C2.
-          - { name: tr-j17-p1-c1only, java: '17', comp: true, extra: '-XX:TieredStopAtLevel=1', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 30' }
-          # Fork-to-fork offsets with CI settings.
-          - { name: tr-j17-p1-3f, java: '17', comp: false, extra: '', jmh: '-p pipelineNum=1 -f 3 -wi 3 -i 5' }
-          - { name: tr-j17-p500-3f, java: '17', comp: false, extra: '', jmh: '-p pipelineNum=500 -f 3 -wi 3 -i 5' }
+          # Candidate fix: lower JIT thresholds so the trigger path compiles within warmup.
+          - { name: cts01-j17-p1, java: '17', comp: true, extra: '-XX:CompileThresholdScaling=0.01', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 20' }
+          - { name: cts01-j17-p10, java: '17', comp: true, extra: '-XX:CompileThresholdScaling=0.01', jmh: '-p pipelineNum=10 -f 1 -wi 0 -i 20' }
+          - { name: cts05-j17-p1, java: '17', comp: true, extra: '-XX:CompileThresholdScaling=0.05', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 20' }
+          - { name: cts05-j17-p10, java: '17', comp: true, extra: '-XX:CompileThresholdScaling=0.05', jmh: '-p pipelineNum=10 -f 1 -wi 0 -i 20' }
+          - { name: cts01-j11-p1, java: '11', comp: true, extra: '-XX:CompileThresholdScaling=0.01', jmh: '-p pipelineNum=1 -f 1 -wi 0 -i 20' }
+          # Full sweep with CI settings and the flag: trend, P-axis order and fork offsets.
+          - { name: cts01-j17-sweep, java: '17', comp: false, extra: '-XX:CompileThresholdScaling=0.01', jmh: '-f 3 -wi 3 -i 5' }
+          - { name: cts01-j11-sweep, java: '11', comp: false, extra: '-XX:CompileThresholdScaling=0.01', jmh: '-f 3 -wi 3 -i 5' }
     env:
       BASE_JVM_ARGS: >-
         -Xms4g -Xmx4g -XX:+UseG1GC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC
