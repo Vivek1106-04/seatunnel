@@ -66,7 +66,7 @@ jobs:
         run: |
           sudo apt-get update -q >/dev/null && sudo apt-get install -y -q bpftrace >/dev/null
           sudo bpftrace --version
-          sudo timeout -s INT 3 bpftrace -q driver/.github/diag/sched.bt > smoke.txt; rc=$?
+          rc=0; sudo timeout -s INT 5 bpftrace -q driver/.github/diag/sched.bt > smoke.txt 2> smoke.err || rc=$?; cat smoke.err
           head -3 smoke.txt; [ $rc -eq 0 ] || [ $rc -eq 124 ] || [ $rc -eq 130 ]
       - name: Apply tracer and build
         run: |
