@@ -1,0 +1,33 @@
+// Off-CPU wait of checkpoint threads: wakeup -> switch-in, with the CPU they were queued on, what
+// ran there, and how many CPUs were idle at wake time. nsecs == CLOCK_MONOTONIC == System.nanoTime.
+tracepoint:sched:sched_switch
+{
+  @cur[cpu] = args.next_comm;
+  @idle[cpu] = args.next_pid == 0 ? 1 : 0;
+  $w = @wt[args.next_pid];
+  if ($w != 0) {
+    $lat = (nsecs - $w) / 1000;
+    @lat[args.next_comm] = lhist($lat, 0, 3000, 100);
+    if ($lat >= 200) {
+      printf("SLOW t=%llu lat=%llu thread=%s/%d ran_on=%d woken_to=%d waker=%s prev=%s/%d prev_state=%d running_at_wake=%s idle_at_wake=%d\n",
+        nsecs, $lat, args.next_comm, args.next_pid, cpu, @wcpu[args.next_pid], @wby[args.next_pid],
+        args.prev_comm, args.prev_pid, args.prev_state, @wrun[args.next_pid], @widle[args.next_pid]);
+    }
+    delete(@wt[args.next_pid]);
+  }
+}
+
+tracepoint:sched:sched_wakeup
+/ strncmp(args.comm, "checkpoint-", 11) == 0 || strncmp(args.comm, "org.apache.seat", 15) == 0 /
+{
+  @wt[args.pid] = nsecs;
+  @wcpu[args.pid] = args.target_cpu;
+  @wby[args.pid] = comm;
+  @wrun[args.pid] = @cur[args.target_cpu];
+  @widle[args.pid] = @idle[0] + @idle[1] + @idle[2] + @idle[3];
+}
+
+END
+{
+  clear(@cur); clear(@idle); clear(@wt); clear(@wcpu); clear(@wby); clear(@wrun); clear(@widle);
+}

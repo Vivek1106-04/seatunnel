@@ -26,7 +26,7 @@ on:
       jmh:
         description: 'JMH args'
         required: false
-        default: '-f 1 -wi 3 -i 5'
+        default: '-p pipelineNum=10,100 -f 1 -wi 3 -i 5'
       extra:
         description: 'Extra JVM args'
         required: false
@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [ '11', '17' ]
+        java: [ '17' ]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,6 +62,12 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
+      - name: Install and smoke-test bpftrace
+        run: |
+          sudo apt-get update -q >/dev/null && sudo apt-get install -y -q bpftrace >/dev/null
+          sudo bpftrace --version
+          sudo timeout -s INT 3 bpftrace -q driver/.github/diag/sched.bt > smoke.txt; rc=$?
+          head -3 smoke.txt; [ $rc -eq 0 ] || [ $rc -eq 124 ] || [ $rc -eq 130 ]
       - name: Apply tracer and build
         run: |
           for arm in baseline candidate; do
@@ -77,11 +83,15 @@ jobs:
             arm=$1; label=$2; d=$out/$label; mkdir -p $d/trace
             echo "== $label start $(date -u +%T)"
             (vmstat -n -t 1 > $d/vmstat.txt) & vm=$!
+            sudo bpftrace -q driver/.github/diag/sched.bt > $d/sched.txt 2> $d/sched.err & bt=$!
+            sleep 5
             (cd $arm && java -jar seatunnel-benchmarks/target/benchmarks.jar CheckpointSchedulingBenchmark \
                ${{ inputs.jmh }} \
                -jvmArgsAppend "-Ddiag.trace.dir=$d/trace -Xlog:safepoint*=info,gc*=info:file=$d/trace/jvm-%p.log:timenanos,uptimenanos,tid ${{ inputs.extra }}" \
                -foe true -rf json -rff $d/result.json > $d/jmh.log 2>&1) || echo "jmh exit $?"
             kill $vm || true
+            sudo pkill -INT bpftrace || true; wait $bt || true
+            grep -c SLOW $d/sched.txt || true
             grep -E '^Iteration|periodicTriggerDelay|Exception' $d/jmh.log | head -80 || true
           }
           run baseline baseline-1
