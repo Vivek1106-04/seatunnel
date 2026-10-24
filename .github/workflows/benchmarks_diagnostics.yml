@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [ '17' ]
+        java: [ '11', '17' ]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,12 +62,6 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
-      - name: Install and smoke-test bpftrace
-        run: |
-          sudo apt-get update -q >/dev/null && sudo apt-get install -y -q bpftrace >/dev/null
-          sudo bpftrace --version
-          rc=0; sudo timeout -s INT 5 bpftrace -q driver/.github/diag/sched.bt > smoke.txt 2> smoke.err || rc=$?; cat smoke.err
-          head -3 smoke.txt; [ $rc -eq 0 ] || [ $rc -eq 124 ] || [ $rc -eq 130 ]
       - name: Apply tracer and build
         run: |
           for arm in baseline candidate; do
@@ -83,21 +77,20 @@ jobs:
             arm=$1; label=$2; d=$out/$label; mkdir -p $d/trace
             echo "== $label start $(date -u +%T)"
             (vmstat -n -t 1 > $d/vmstat.txt) & vm=$!
-            sudo bpftrace -q driver/.github/diag/sched.bt > $d/sched.txt 2> $d/sched.err & bt=$!
-            sleep 5
+            pin=$3; pl=""
+            if [ "$pin" = pin ]; then bash driver/.github/diag/pin.sh > $d/pin.txt 2>&1 & pl=$!; fi
             (cd $arm && java -jar seatunnel-benchmarks/target/benchmarks.jar CheckpointSchedulingBenchmark \
                ${{ inputs.jmh }} \
                -jvmArgsAppend "-Ddiag.trace.dir=$d/trace -Xlog:safepoint*=info,gc*=info:file=$d/trace/jvm-%p.log:timenanos,uptimenanos,tid ${{ inputs.extra }}" \
                -foe true -rf json -rff $d/result.json > $d/jmh.log 2>&1) || echo "jmh exit $?"
             kill $vm || true
-            sudo pkill -INT bpftrace || true; wait $bt || true
-            grep -c SLOW $d/sched.txt || true
+            [ -n "$pl" ] && kill $pl || true
             grep -E '^Iteration|periodicTriggerDelay|Exception' $d/jmh.log | head -80 || true
           }
-          run baseline baseline-1
-          run candidate candidate-1
-          run candidate candidate-2
-          run baseline baseline-2
+          run baseline baseline-free
+          run candidate candidate-free
+          run candidate candidate-pinned pin
+          run baseline baseline-pinned pin
       - uses: actions/upload-artifact@v4
         if: always()
         with:
