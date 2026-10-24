@@ -74,8 +74,8 @@ jobs:
           out=${PWD}/out; mkdir -p $out
           { uname -a; lscpu; nproc; free -h; java -version 2>&1; cat /proc/sys/kernel/sched_schedstats 2>&1;
             echo "cpuidle driver: $(cat /sys/devices/system/cpu/cpuidle/current_driver 2>&1) governor: $(cat /sys/devices/system/cpu/cpuidle/current_governor_ro /sys/devices/system/cpu/cpuidle/current_governor 2>/dev/null)";
-            grep -H . /sys/devices/system/cpu/cpu0/cpuidle/state*/{name,latency,usage} 2>&1;
-            cat /sys/devices/system/clocksource/clocksource0/current_clocksource; } > $out/environment.txt
+            cat /proc/cpuinfo | grep -m1 'model name';
+            cat /sys/devices/system/clocksource/clocksource0/current_clocksource; } > $out/environment.txt 2>&1 || true
           cat $out/environment.txt | tail -20
           run() {
             arm=$1; label=$2; d=$out/$label; mkdir -p $d/trace
@@ -96,10 +96,12 @@ jobs:
           }
           run baseline baseline-free
           run candidate candidate-free
-          run candidate candidate-qos qos
-          run baseline baseline-qos qos
           run candidate candidate-idlespin idlespin
           run baseline baseline-idlespin idlespin
+          run baseline baseline-free2
+          run candidate candidate-free2
+          run candidate candidate-idlespin2 idlespin
+          run baseline baseline-idlespin2 idlespin
       - uses: actions/upload-artifact@v4
         if: always()
         with:
