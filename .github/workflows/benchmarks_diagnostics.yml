@@ -72,25 +72,34 @@ jobs:
       - name: Run
         run: |
           out=${PWD}/out; mkdir -p $out
-          { uname -a; lscpu; nproc; free -h; java -version 2>&1; cat /proc/sys/kernel/sched_schedstats 2>&1; } > $out/environment.txt
+          { uname -a; lscpu; nproc; free -h; java -version 2>&1; cat /proc/sys/kernel/sched_schedstats 2>&1;
+            echo "cpuidle driver: $(cat /sys/devices/system/cpu/cpuidle/current_driver 2>&1) governor: $(cat /sys/devices/system/cpu/cpuidle/current_governor_ro /sys/devices/system/cpu/cpuidle/current_governor 2>/dev/null)";
+            grep -H . /sys/devices/system/cpu/cpu0/cpuidle/state*/{name,latency,usage} 2>&1;
+            cat /sys/devices/system/clocksource/clocksource0/current_clocksource; } > $out/environment.txt
+          cat $out/environment.txt | tail -20
           run() {
             arm=$1; label=$2; d=$out/$label; mkdir -p $d/trace
             echo "== $label start $(date -u +%T)"
             (vmstat -n -t 1 > $d/vmstat.txt) & vm=$!
             pin=$3; pl=""
-            if [ "$pin" = pin ]; then bash driver/.github/diag/pin.sh > $d/pin.txt 2>&1 & pl=$!; fi
+            if [ "$pin" = qos ]; then sudo python3 driver/.github/diag/qos.py > $d/qos.txt 2>&1 & pl=$!; sleep 1; cat $d/qos.txt; fi
+            if [ "$pin" = idlespin ]; then for c in 0 1 2 3; do taskset -c $c chrt -i 0 bash -c 'while :; do :; done' & done; pl=1; sleep 1; ps -eo pid,cls,psr,comm | grep -E ' IDL ' | head; fi
+            grep -H . /sys/devices/system/cpu/cpu*/cpuidle/state*/usage > $d/idle-before.txt 2>/dev/null || true
             (cd $arm && java -jar seatunnel-benchmarks/target/benchmarks.jar CheckpointSchedulingBenchmark \
                ${{ inputs.jmh }} \
                -jvmArgsAppend "-Ddiag.trace.dir=$d/trace -Xlog:safepoint*=info,gc*=info:file=$d/trace/jvm-%p.log:timenanos,uptimenanos,tid ${{ inputs.extra }}" \
                -foe true -rf json -rff $d/result.json > $d/jmh.log 2>&1) || echo "jmh exit $?"
             kill $vm || true
-            [ -n "$pl" ] && kill $pl || true
+            grep -H . /sys/devices/system/cpu/cpu*/cpuidle/state*/usage > $d/idle-after.txt 2>/dev/null || true
+            [ -n "$pl" ] && { sudo pkill -f qos.py; pkill -f 'while :; do :; done'; } || true
             grep -E '^Iteration|periodicTriggerDelay|Exception' $d/jmh.log | head -80 || true
           }
           run baseline baseline-free
           run candidate candidate-free
-          run candidate candidate-pinned pin
-          run baseline baseline-pinned pin
+          run candidate candidate-qos qos
+          run baseline baseline-qos qos
+          run candidate candidate-idlespin idlespin
+          run baseline baseline-idlespin idlespin
       - uses: actions/upload-artifact@v4
         if: always()
         with:
