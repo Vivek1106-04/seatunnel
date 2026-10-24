@@ -64,7 +64,8 @@ jobs:
           java-version: ${{ matrix.java }}
       - name: Apply tracer and build
         run: |
-          for arm in baseline candidate; do
+          cp -r candidate inline
+          for arm in baseline candidate inline; do
             git -C $arm apply ../driver/.github/diag/$arm.patch
             git -C $arm diff --stat
             (cd $arm && ./mvnw -B -q -Pbenchmark -pl seatunnel-benchmarks -am -DskipTests -Dskip.spotless=true package)
@@ -83,7 +84,6 @@ jobs:
             (vmstat -n -t 1 > $d/vmstat.txt) & vm=$!
             pin=$3; pl=""
             if [ "$pin" = qos ]; then sudo python3 driver/.github/diag/qos.py > $d/qos.txt 2>&1 & pl=$!; sleep 1; cat $d/qos.txt; fi
-            if [ "$pin" = idlespin ]; then for c in 0 1 2 3; do taskset -c $c chrt -i 0 bash -c 'while :; do :; done' & done; pl=1; sleep 1; ps -eo pid,cls,psr,comm | grep -E ' IDL ' | head; fi
             grep -H . /sys/devices/system/cpu/cpu*/cpuidle/state*/usage > $d/idle-before.txt 2>/dev/null || true
             (cd $arm && java -jar seatunnel-benchmarks/target/benchmarks.jar CheckpointSchedulingBenchmark \
                ${{ inputs.jmh }} \
@@ -94,14 +94,12 @@ jobs:
             [ -n "$pl" ] && { sudo pkill -f qos.py; pkill -f 'while :; do :; done'; } || true
             grep -E '^Iteration|periodicTriggerDelay|Exception' $d/jmh.log | head -80 || true
           }
-          run baseline baseline-free
-          run candidate candidate-free
-          run candidate candidate-idlespin idlespin
-          run baseline baseline-idlespin idlespin
-          run baseline baseline-free2
-          run candidate candidate-free2
-          run candidate candidate-idlespin2 idlespin
-          run baseline baseline-idlespin2 idlespin
+          run baseline baseline-1
+          run candidate candidate-1
+          run inline inline-1
+          run inline inline-2
+          run candidate candidate-2
+          run baseline baseline-2
       - uses: actions/upload-artifact@v4
         if: always()
         with:

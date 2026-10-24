@@ -1,0 +1,326 @@
+diff --git a/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/CheckpointCoordinator.java b/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/CheckpointCoordinator.java
+index f0d52242a..de06476f7 100644
+--- a/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/CheckpointCoordinator.java
++++ b/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/CheckpointCoordinator.java
+@@ -569,8 +569,16 @@ public class CheckpointCoordinator {
+     @VisibleForTesting
+     protected void scheduleTriggerPendingCheckpoint(
+             CheckpointType checkpointType, long delayMills) {
++        long diagDue = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMills);
+         scheduler.schedule(
+-                () -> tryTriggerPendingCheckpoint(checkpointType),
++                () -> {
++                    DiagTriggerTrace.start(diagDue);
++                    try {
++                        tryTriggerPendingCheckpoint(checkpointType);
++                    } finally {
++                        DiagTriggerTrace.afterBody();
++                    }
++                },
+                 delayMills,
+                 TimeUnit.MILLISECONDS);
+     }
+@@ -820,6 +828,7 @@ public class CheckpointCoordinator {
+             }
+         }
+         synchronized (lock) {
++            DiagTriggerTrace.locked();
+             if (isCompleted() || isShutdown()) {
+                 LOG.warn(
+                         "can't trigger checkpoint with type: {}, because checkpoint coordinator"
+@@ -1079,6 +1088,7 @@ public class CheckpointCoordinator {
+                 },
+                 executorService);
+         pendingCounter.incrementAndGet();
++        DiagTriggerTrace.increment(jobId);
+     }
+ 
+     private CompletableFuture<PendingCheckpoint> createPendingCheckpoint(
+diff --git a/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/DiagTriggerTrace.java b/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/DiagTriggerTrace.java
+new file mode 100644
+index 000000000..2990104d2
+--- /dev/null
++++ b/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/DiagTriggerTrace.java
+@@ -0,0 +1,206 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.seatunnel.engine.server.checkpoint;
++
++import java.io.File;
++import java.io.FileWriter;
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.lang.management.ManagementFactory;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.concurrent.ConcurrentLinkedQueue;
++
++/**
++ * THROWAWAY diagnostic for apache/seatunnel#12165 tail spikes, fork branches diag-12165-* only.
++ * Records, per periodic trigger that reaches pendingCounter++, a timestamp for every stage of the
++ * trigger path plus the kernel run-queue wait (/proc/thread-self/schedstat) of the threads that
++ * carried it. All times are System.nanoTime, the same clock as -Xlog's timenanos decorator.
++ * Enabled by -Ddiag.trace.dir; written at JVM exit.
++ */
++public final class DiagTriggerTrace {
++
++    public static final boolean ON = System.getProperty("diag.trace.dir") != null;
++
++    // Timer-side fields (shared scheduler only), filled by the timer thread around execute().
++    public static final int T_FIRE = 0;
++    public static final int T_SUBMITTED = 1;
++    public static final int T_POOL_BEFORE = 2;
++    public static final int T_ACTIVE_BEFORE = 3;
++    public static final int T_QUEUE_BEFORE = 4;
++    public static final int T_POOL_AFTER = 5;
++    public static final int T_TID = 6;
++    public static final int T_WAIT = 7;
++    public static final int T_CPU = 8;
++    public static final int T_LEN = 9;
++
++    private static final class Row {
++        long[] timer;
++        long jobId;
++        long due;
++        long run;
++        long body;
++        long locked;
++        long inc;
++        long tid;
++        long wait;
++        long cpu;
++        long slices;
++    }
++
++    private static final ThreadLocal<Row> CURRENT = new ThreadLocal<>();
++    private static final ThreadLocal<Row> EMITTED = new ThreadLocal<>();
++    private static final ThreadLocal<Long> TID = new ThreadLocal<>();
++    private static final ConcurrentLinkedQueue<Row> ROWS = new ConcurrentLinkedQueue<>();
++
++    static {
++        if (ON) {
++            Runtime.getRuntime().addShutdownHook(new Thread(DiagTriggerTrace::dump));
++        }
++    }
++
++    private DiagTriggerTrace() {}
++
++    /** Dispatch worker picked the task up (shared scheduler only). */
++    public static void dispatchStart(long[] timer) {
++        if (ON) {
++            Row row = new Row();
++            row.timer = timer;
++            row.run = System.nanoTime();
++            CURRENT.set(row);
++        }
++    }
++
++    /** First line of the scheduled trigger lambda. */
++    static void start(long dueNanos) {
++        if (ON) {
++            long now = System.nanoTime();
++            Row row = CURRENT.get();
++            if (row == null) {
++                row = new Row();
++                row.run = now;
++                CURRENT.set(row);
++            }
++            row.due = dueNanos;
++            row.body = now;
++        }
++    }
++
++    static void locked() {
++        if (ON) {
++            Row row = CURRENT.get();
++            if (row != null) {
++                row.locked = System.nanoTime();
++            }
++        }
++    }
++
++    static void increment(long jobId) {
++        if (ON) {
++            long now = System.nanoTime();
++            Row row = CURRENT.get();
++            if (row != null && row.body != 0) {
++                row.jobId = jobId;
++                row.inc = now;
++                ROWS.add(row);
++                EMITTED.set(row);
++            }
++        }
++    }
++
++    /** After the trigger body returned: run-queue wait of this thread, outside the measured span. */
++    static void afterBody() {
++        if (ON) {
++            Row row = EMITTED.get();
++            if (row != null) {
++                long[] s = schedstat();
++                row.tid = tid();
++                row.cpu = s[0];
++                row.wait = s[1];
++                row.slices = s[2];
++            }
++            EMITTED.remove();
++            CURRENT.remove();
++        }
++    }
++
++    /** Timer thread, after execute(): its own run-queue wait. */
++    public static void timerAfter(long[] timer) {
++        long[] s = schedstat();
++        timer[T_TID] = tid();
++        timer[T_CPU] = s[0];
++        timer[T_WAIT] = s[1];
++    }
++
++    private static long tid() {
++        Long tid = TID.get();
++        if (tid == null) {
++            try {
++                Path link = Files.readSymbolicLink(Paths.get("/proc/thread-self"));
++                tid = Long.parseLong(link.getFileName().toString());
++            } catch (IOException | RuntimeException e) {
++                tid = -1L;
++            }
++            TID.set(tid);
++        }
++        return tid;
++    }
++
++    private static long[] schedstat() {
++        long[] out = new long[] {-1, -1, -1};
++        try {
++            String[] f =
++                    new String(
++                                    Files.readAllBytes(Paths.get("/proc/thread-self/schedstat")),
++                                    StandardCharsets.US_ASCII)
++                            .trim()
++                            .split(" ");
++            for (int i = 0; i < 3 && i < f.length; i++) {
++                out[i] = Long.parseLong(f[i]);
++            }
++        } catch (IOException | RuntimeException e) {
++            // leave -1
++        }
++        return out;
++    }
++
++    private static void dump() {
++        String dir = System.getProperty("diag.trace.dir");
++        String pid = ManagementFactory.getRuntimeMXBean().getName().split("@")[0];
++        File file = new File(dir, "trace-" + pid + ".csv");
++        try (PrintWriter out = new PrintWriter(new FileWriter(file))) {
++            out.println(
++                    "job_id,due,fire,submitted,pool_before,active_before,queue_before,pool_after,"
++                            + "timer_tid,timer_wait,timer_cpu,run,body,locked,inc,tid,wait,cpu,slices");
++            for (Row r : ROWS) {
++                long[] t = r.timer != null ? r.timer : new long[T_LEN];
++                out.println(
++                        r.jobId + "," + r.due + "," + t[T_FIRE] + "," + t[T_SUBMITTED] + ","
++                                + t[T_POOL_BEFORE] + "," + t[T_ACTIVE_BEFORE] + ","
++                                + t[T_QUEUE_BEFORE] + "," + t[T_POOL_AFTER] + "," + t[T_TID]
++                                + "," + t[T_WAIT] + "," + t[T_CPU] + "," + r.run + "," + r.body
++                                + "," + r.locked + "," + r.inc + "," + r.tid + "," + r.wait + ","
++                                + r.cpu + "," + r.slices);
++            }
++        } catch (IOException e) {
++            e.printStackTrace();
++        }
++    }
++}
+diff --git a/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/scheduler/PipelineCheckpointTask.java b/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/scheduler/PipelineCheckpointTask.java
+index 147c0c23c..dc9e0dec2 100644
+--- a/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/scheduler/PipelineCheckpointTask.java
++++ b/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/scheduler/PipelineCheckpointTask.java
+@@ -17,6 +17,8 @@
+ 
+ package org.apache.seatunnel.engine.server.checkpoint.scheduler;
+ 
++import org.apache.seatunnel.engine.server.checkpoint.DiagTriggerTrace;
++
+ import org.apache.seatunnel.engine.common.utils.concurrent.CompletableFuture;
+ 
+ import java.util.concurrent.Delayed;
+@@ -36,6 +38,9 @@ import java.util.function.Consumer;
+  */
+ final class PipelineCheckpointTask implements ScheduledFuture<Void>, Runnable {
+ 
++    volatile long[] diag;
++
++
+     private final Runnable body;
+     private final Consumer<PipelineCheckpointTask> onSettled;
+     private final AtomicBoolean cancelled = new AtomicBoolean(false);
+@@ -92,6 +97,7 @@ final class PipelineCheckpointTask implements ScheduledFuture<Void>, Runnable {
+         if (cancelled.get()) {
+             return;
+         }
++        DiagTriggerTrace.dispatchStart(diag);
+         try {
+             body.run();
+             completion.complete(null);
+diff --git a/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/scheduler/SharedCheckpointScheduler.java b/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/scheduler/SharedCheckpointScheduler.java
+index 5342c856d..005fecf15 100644
+--- a/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/scheduler/SharedCheckpointScheduler.java
++++ b/seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/checkpoint/scheduler/SharedCheckpointScheduler.java
+@@ -17,6 +17,8 @@
+ 
+ package org.apache.seatunnel.engine.server.checkpoint.scheduler;
+ 
++import org.apache.seatunnel.engine.server.checkpoint.DiagTriggerTrace;
++
+ import org.apache.seatunnel.shade.com.google.common.util.concurrent.ThreadFactoryBuilder;
+ 
+ import lombok.extern.slf4j.Slf4j;
+@@ -155,7 +157,7 @@ public class SharedCheckpointScheduler implements AutoCloseable {
+      */
+     ScheduledFuture<?> dispatchAfter(PipelineCheckpointTask task, long delay, TimeUnit unit) {
+         try {
+-            return timer.schedule(() -> submit(task), delay, unit);
++            return timer.schedule(task, delay, unit);
+         } catch (RejectedExecutionException e) {
+             // Only reachable once close() has begun; the coordinator is stopping anyway.
+             log.debug("Shared checkpoint scheduler is shut down, dropping timer task", e);
+@@ -165,8 +167,22 @@ public class SharedCheckpointScheduler implements AutoCloseable {
+     }
+ 
+     private void submit(PipelineCheckpointTask task) {
++        long[] diag = null;
++        if (DiagTriggerTrace.ON) {
++            diag = new long[DiagTriggerTrace.T_LEN];
++            diag[DiagTriggerTrace.T_FIRE] = System.nanoTime();
++            diag[DiagTriggerTrace.T_POOL_BEFORE] = dispatcher.getPoolSize();
++            diag[DiagTriggerTrace.T_ACTIVE_BEFORE] = dispatcher.getActiveCount();
++            diag[DiagTriggerTrace.T_QUEUE_BEFORE] = dispatcher.getQueue().size();
++            task.diag = diag;
++        }
+         try {
+             dispatcher.execute(task);
++            if (diag != null) {
++                diag[DiagTriggerTrace.T_SUBMITTED] = System.nanoTime();
++                diag[DiagTriggerTrace.T_POOL_AFTER] = dispatcher.getPoolSize();
++                DiagTriggerTrace.timerAfter(diag);
++            }
+         } catch (RejectedExecutionException e) {
+             log.debug("Shared checkpoint dispatcher is shut down, dropping checkpoint task", e);
+             task.cancel(false);
