@@ -584,7 +584,7 @@ public class CheckpointCoordinatorTest
                     coordinatorFuture(coordinator);
 
             executor.execute(() -> awaitQuietly(releaseExecutor));
-            expire(coordinator, expired, generationBeforeRestore);
+            coordinator.expireCheckpoint(expired, generationBeforeRestore);
 
             coordinator.restoreCoordinator(false);
             CompletableFuture<CheckpointCoordinatorState> restoredGeneration =
@@ -619,7 +619,7 @@ public class CheckpointCoordinatorTest
             CompletableFuture<CheckpointCoordinatorState> generation =
                     coordinatorFuture(coordinator);
 
-            expire(coordinator, expired, generation);
+            coordinator.expireCheckpoint(expired, generation);
 
             CheckpointCoordinatorState state = generation.get(10, TimeUnit.SECONDS);
             Assertions.assertEquals(
@@ -629,6 +629,201 @@ public class CheckpointCoordinatorTest
         } finally {
             executor.shutdownNow();
         }
+    }
+
+    /**
+     * A checkpoint that fails after {@code restoreCoordinator} reused the coordinator belongs to
+     * the generation before the restore, so its error handler, which the coordinator executor runs
+     * later, must be dropped rather than fail the restored one.
+     */
+    @Test
+    void testCheckpointErrorHeldAcrossCoordinatorRestoreDoesNotFailTheRestoredGeneration()
+            throws Exception {
+        // two workers: the trigger body and the barrier round-trip it waits for
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch releaseExecutor = new CountDownLatch(1);
+        try {
+            CheckpointManager checkpointManager = mockCheckpointManager();
+            CheckpointCoordinator coordinator =
+                    buildExpiryTestCoordinator(checkpointManager, executor);
+            CompletableFuture<CompletedCheckpoint> checkpointResult = new CompletableFuture<>();
+            startCheckpoint(coordinator, checkpointResult);
+            CompletableFuture<CheckpointCoordinatorState> generationBeforeRestore =
+                    coordinatorFuture(coordinator);
+
+            // hold both workers, so the error handler queues behind them
+            executor.execute(() -> awaitQuietly(releaseExecutor));
+            executor.execute(() -> awaitQuietly(releaseExecutor));
+            checkpointResult.completeExceptionally(new IllegalStateException("barrier failed"));
+
+            coordinator.restoreCoordinator(false);
+            CompletableFuture<CheckpointCoordinatorState> restoredGeneration =
+                    coordinatorFuture(coordinator);
+
+            releaseExecutor.countDown();
+            executor.shutdown();
+            Assertions.assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS));
+
+            Assertions.assertNotSame(generationBeforeRestore, restoredGeneration);
+            Assertions.assertFalse(
+                    restoredGeneration.isDone(),
+                    "an error of the generation before the restore must not fail the restored one");
+            Mockito.verify(checkpointManager, Mockito.never())
+                    .handleCheckpointError(Mockito.anyInt(), Mockito.anyBoolean());
+        } finally {
+            releaseExecutor.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    /** The generation fence must not stop a checkpoint error from failing its own generation. */
+    @Test
+    void testCheckpointErrorOfTheCurrentGenerationFailsTheCoordinator() throws Exception {
+        ExecutorService executor = Executors.newCachedThreadPool();
+        try {
+            CheckpointManager checkpointManager = mockCheckpointManager();
+            CheckpointCoordinator coordinator =
+                    buildExpiryTestCoordinator(checkpointManager, executor);
+            CompletableFuture<CompletedCheckpoint> checkpointResult = new CompletableFuture<>();
+            startCheckpoint(coordinator, checkpointResult);
+            CompletableFuture<CheckpointCoordinatorState> generation =
+                    coordinatorFuture(coordinator);
+
+            checkpointResult.completeExceptionally(new IllegalStateException("barrier failed"));
+
+            CheckpointCoordinatorState state = generation.get(10, TimeUnit.SECONDS);
+            Assertions.assertEquals(
+                    CheckpointCoordinatorStatus.FAILED, state.getCheckpointCoordinatorStatus());
+            Assertions.assertTrue(state.getThrowableMsg().contains("barrier failed"));
+            Mockito.verify(checkpointManager, Mockito.timeout(10_000))
+                    .handleCheckpointError(1, false);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * A periodic trigger body that is already running is not reached by the {@code cancelAll} of a
+     * restore. If it throws after the restore, its error belongs to the generation that scheduled
+     * it and must not fail the restored one.
+     */
+    @Test
+    void testScheduledTriggerErrorAfterCoordinatorRestoreDoesNotFailTheRestoredGeneration()
+            throws Exception {
+        ExecutorService executor = Executors.newCachedThreadPool();
+        CountDownLatch triggerStarted = new CountDownLatch(1);
+        CountDownLatch restored = new CountDownLatch(1);
+        try {
+            CheckpointManager checkpointManager = mockCheckpointManager();
+            CheckpointCoordinator coordinator =
+                    Mockito.spy(buildExpiryTestCoordinator(checkpointManager, executor));
+            Mockito.doAnswer(
+                            invocation -> {
+                                triggerStarted.countDown();
+                                restored.await();
+                                throw new IllegalStateException("periodic trigger failed");
+                            })
+                    .when(coordinator)
+                    .tryTriggerPendingCheckpoint(CheckpointType.CHECKPOINT_TYPE);
+
+            coordinator.scheduleTriggerPendingCheckpoint(CheckpointType.CHECKPOINT_TYPE, 0);
+            Assertions.assertTrue(triggerStarted.await(10, TimeUnit.SECONDS));
+            coordinator.restoreCoordinator(false);
+            CompletableFuture<CheckpointCoordinatorState> restoredGeneration =
+                    coordinatorFuture(coordinator);
+            restored.countDown();
+
+            // nothing completes when the error is dropped, so watch for a failure for a while
+            Mockito.verify(checkpointManager, Mockito.after(1000).never())
+                    .handleCheckpointError(Mockito.anyInt(), Mockito.anyBoolean());
+            Assertions.assertFalse(
+                    restoredGeneration.isDone(),
+                    "a trigger error of the generation before the restore must not fail the restored one");
+        } finally {
+            restored.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * {@code startSavepoint} holds {@code lock} in its sleep-poll while a checkpoint is pending,
+     * and that checkpoint can be the one that expires. The expiry fails the generation under {@code
+     * generationLock} and only then cleans up under {@code lock}; it must not deadlock with the
+     * poll, which ends because the cleanup marks the coordinator shut down before it waits for
+     * {@code lock}.
+     */
+    @Test
+    void testExpiryDuringSavepointPollFailsTheCoordinatorAndEndsThePoll() throws Exception {
+        ExecutorService executor = Executors.newCachedThreadPool();
+        ExecutorService savepointCaller = Executors.newSingleThreadExecutor();
+        try {
+            CheckpointManager checkpointManager = mockCheckpointManager();
+            CheckpointCoordinator coordinator =
+                    buildExpiryTestCoordinator(checkpointManager, executor);
+            PendingCheckpoint expired = trackPendingCheckpoint(coordinator, 1L);
+            ((AtomicInteger) ReflectionUtils.getField(coordinator, "pendingCounter").get()).set(1);
+            ((AtomicBoolean) ReflectionUtils.getField(coordinator, "isAllTaskReady").get())
+                    .set(true);
+            CompletableFuture<CheckpointCoordinatorState> generation =
+                    coordinatorFuture(coordinator);
+
+            AtomicReference<Thread> pollingThread = new AtomicReference<>();
+            Future<PassiveCompletableFuture<CompletedCheckpoint>> savepoint =
+                    savepointCaller.submit(
+                            () -> {
+                                pollingThread.set(Thread.currentThread());
+                                return coordinator.startSavepoint();
+                            });
+            // the poll sleeps while it holds the lock
+            await().atMost(10, TimeUnit.SECONDS)
+                    .until(
+                            () ->
+                                    pollingThread.get() != null
+                                            && pollingThread.get().getState()
+                                                    == Thread.State.TIMED_WAITING);
+
+            coordinator.expireCheckpoint(expired, generation);
+
+            CheckpointCoordinatorState state = generation.get(10, TimeUnit.SECONDS);
+            Assertions.assertEquals(
+                    CheckpointCoordinatorStatus.FAILED, state.getCheckpointCoordinatorStatus());
+            ExecutionException savepointError =
+                    Assertions.assertThrows(
+                            ExecutionException.class,
+                            () -> savepoint.get(10, TimeUnit.SECONDS).get(10, TimeUnit.SECONDS));
+            Assertions.assertEquals(
+                    CheckpointCloseReason.CHECKPOINT_COORDINATOR_SHUTDOWN,
+                    ((CheckpointException) savepointError.getCause()).getCheckpointFailureReason());
+            Mockito.verify(checkpointManager, Mockito.timeout(10_000))
+                    .handleCheckpointError(1, false);
+        } finally {
+            savepointCaller.shutdownNow();
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * Runs the trigger body of an untracked checkpoint whose result the test completes, and waits
+     * until the body has armed its timeout watchdog, so the coordinator executor is idle again.
+     */
+    private static void startCheckpoint(
+            CheckpointCoordinator coordinator, CompletableFuture<CompletedCheckpoint> result) {
+        PendingCheckpoint pendingCheckpoint = Mockito.mock(PendingCheckpoint.class);
+        Mockito.when(pendingCheckpoint.getCheckpointId()).thenReturn(1L);
+        Mockito.when(pendingCheckpoint.getCheckpointType())
+                .thenReturn(CheckpointType.CHECKPOINT_TYPE);
+        Mockito.when(pendingCheckpoint.getCompletableFuture())
+                .thenReturn(new PassiveCompletableFuture<>(result));
+        CompletableFuture<PendingCheckpoint> pending = new CompletableFuture<>();
+        pending.complete(pendingCheckpoint);
+
+        ReflectionUtils.invoke(
+                coordinator,
+                "startTriggerPendingCheckpoint",
+                new Class[] {CompletableFuture.class},
+                new Object[] {pending});
+        Mockito.verify(pendingCheckpoint, Mockito.timeout(10_000))
+                .setCheckpointTimeOutFuture(Mockito.any());
     }
 
     private static CheckpointCoordinator buildExpiryTestCoordinator(
@@ -671,17 +866,6 @@ public class CheckpointCoordinatorTest
             CheckpointCoordinator coordinator) {
         return (CompletableFuture<CheckpointCoordinatorState>)
                 ReflectionUtils.getField(coordinator, "checkpointCoordinatorFuture").get();
-    }
-
-    private static void expire(
-            CheckpointCoordinator coordinator,
-            PendingCheckpoint expired,
-            CompletableFuture<CheckpointCoordinatorState> owner) {
-        ReflectionUtils.invoke(
-                coordinator,
-                "expireCheckpoint",
-                new Class[] {PendingCheckpoint.class, CompletableFuture.class},
-                new Object[] {expired, owner});
     }
 
     private static void awaitQuietly(CountDownLatch latch) {

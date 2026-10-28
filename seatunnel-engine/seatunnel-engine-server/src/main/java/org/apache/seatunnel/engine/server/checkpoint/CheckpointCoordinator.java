@@ -372,7 +372,8 @@ public class CheckpointCoordinator {
      * @param expired the pending checkpoint the watchdog found not fully acknowledged
      * @param owner the coordinator future that was current when {@code expired} was triggered
      */
-    private void expireCheckpoint(
+    @VisibleForTesting
+    void expireCheckpoint(
             PendingCheckpoint expired, CompletableFuture<CheckpointCoordinatorState> owner) {
         Runnable expiry = () -> failExpiredCheckpoint(expired, owner);
         try {
@@ -402,10 +403,8 @@ public class CheckpointCoordinator {
      */
     private void failExpiredCheckpoint(
             PendingCheckpoint expired, CompletableFuture<CheckpointCoordinatorState> owner) {
-        CheckpointCloseReason reason = CheckpointCloseReason.CHECKPOINT_EXPIRED;
         synchronized (generationLock) {
-            if (owner != checkpointCoordinatorFuture
-                    || owner.isDone()
+            if (!isCurrentGeneration(owner)
                     || pendingCheckpoints.get(expired.getCheckpointId()) != expired) {
                 LOG.info(
                         "Dropping the expiry of checkpoint {} of pipeline {}, the coordinator generation that triggered it has already ended",
@@ -413,15 +412,65 @@ public class CheckpointCoordinator {
                         pipelineId);
                 return;
             }
-            errorByPhysicalVertex.compareAndSet(
-                    null, ExceptionUtils.getMessage(new CheckpointException(reason, null)));
-            updateStatus(CheckpointCoordinatorStatus.FAILED);
-            owner.complete(
-                    new CheckpointCoordinatorState(
-                            CheckpointCoordinatorStatus.FAILED, errorByPhysicalVertex.get()));
-            cleanPendingCheckpoint(reason);
+            failGeneration(owner, CheckpointCloseReason.CHECKPOINT_EXPIRED, null);
         }
         checkpointManager.handleCheckpointError(pipelineId, false);
+    }
+
+    /**
+     * Fails the coordinator generation that started some asynchronous work, for an error that work
+     * raised, if that generation is still current.
+     *
+     * <p>A barrier round-trip, a checkpoint completion, a checkpoint id lookup or a scheduled
+     * trigger can finish after {@link #restoreCoordinator(boolean)} has reused this coordinator.
+     * Their errors belong to the generation before the restore and must not fail the restored one,
+     * so they are dropped under {@link #generationLock}, the same way {@link
+     * #failExpiredCheckpoint} drops a stale expiry. Synchronous callers keep using {@link
+     * #handleCoordinatorError(String, Throwable, CheckpointCloseReason)}, because they run in the
+     * generation that raised the error.
+     *
+     * @param owner the coordinator future that was current when the failed work was started
+     */
+    private void handleCoordinatorError(
+            CompletableFuture<CheckpointCoordinatorState> owner,
+            String message,
+            Throwable e,
+            CheckpointCloseReason reason) {
+        synchronized (generationLock) {
+            if (!isCurrentGeneration(owner)) {
+                LOG.info(
+                        "Dropping a coordinator error of pipeline {}, the coordinator generation that raised it has already ended: {}: {}",
+                        pipelineId,
+                        message,
+                        ExceptionUtils.getMessage(e));
+                return;
+            }
+            LOG.error(message, e);
+            failGeneration(owner, reason, e);
+        }
+        checkpointManager.handleCheckpointError(pipelineId, false);
+    }
+
+    private boolean isCurrentGeneration(CompletableFuture<CheckpointCoordinatorState> owner) {
+        return owner == checkpointCoordinatorFuture && !owner.isDone();
+    }
+
+    /**
+     * Moves the current generation {@code owner} to FAILED. The caller holds {@link
+     * #generationLock} and has checked that {@code owner} is current, and notifies {@link
+     * CheckpointManager#handleCheckpointError(int, boolean)} after releasing the lock.
+     */
+    private void failGeneration(
+            CompletableFuture<CheckpointCoordinatorState> owner,
+            CheckpointCloseReason reason,
+            Throwable e) {
+        errorByPhysicalVertex.compareAndSet(
+                null, ExceptionUtils.getMessage(new CheckpointException(reason, e)));
+        updateStatus(CheckpointCoordinatorStatus.FAILED);
+        owner.complete(
+                new CheckpointCoordinatorState(
+                        CheckpointCoordinatorStatus.FAILED, errorByPhysicalVertex.get()));
+        cleanPendingCheckpoint(reason);
     }
 
     private void handleCoordinatorError(CheckpointCloseReason reason, Throwable e) {
@@ -620,6 +669,9 @@ public class CheckpointCoordinator {
     @VisibleForTesting
     protected void scheduleTriggerPendingCheckpoint(
             CheckpointType checkpointType, long delayMills) {
+        // A trigger body that already started is not reached by a restore's cancelAll, so its
+        // error must only fail the generation that scheduled it.
+        CompletableFuture<CheckpointCoordinatorState> owner = checkpointCoordinatorFuture;
         scheduler.schedule(
                 () -> {
                     try {
@@ -628,6 +680,7 @@ public class CheckpointCoordinator {
                         // A thrown trigger would otherwise drop the scheduled checkpoint chain
                         // silently; fail the coordinator so the job can handle the error.
                         handleCoordinatorError(
+                                owner,
                                 String.format(
                                         "Failed to trigger %s for job id: %s, pipeline id: %s",
                                         checkpointType, jobId, pipelineId),
@@ -1069,6 +1122,7 @@ public class CheckpointCoordinator {
                             (completedCheckpoint, error) -> {
                                 if (error != null) {
                                     handleCoordinatorError(
+                                            owner,
                                             "trigger checkpoint failed",
                                             error,
                                             CheckpointCloseReason.CHECKPOINT_INSIDE_ERROR);
@@ -1077,6 +1131,7 @@ public class CheckpointCoordinator {
                                         completePendingCheckpoint(completedCheckpoint);
                                     } catch (Throwable e) {
                                         handleCoordinatorError(
+                                                owner,
                                                 "complete checkpoint failed",
                                                 e,
                                                 CheckpointCloseReason.CHECKPOINT_INSIDE_ERROR);
@@ -1107,12 +1162,14 @@ public class CheckpointCoordinator {
                         CompletableFuture.allOf(completableFutureArray).get();
                     } catch (InterruptedException e) {
                         handleCoordinatorError(
+                                owner,
                                 "triggering checkpoint barrier has been interrupted",
                                 e,
                                 CheckpointCloseReason.CHECKPOINT_INSIDE_ERROR);
                         return;
                     } catch (Exception e) {
                         handleCoordinatorError(
+                                owner,
                                 "triggering checkpoint barrier failed",
                                 e,
                                 CheckpointCloseReason.CHECKPOINT_INSIDE_ERROR);
@@ -1156,6 +1213,7 @@ public class CheckpointCoordinator {
         synchronized (lock) {
             CompletableFuture<Long> idFuture;
             if (checkpointType.notCompletedCheckpoint()) {
+                CompletableFuture<CheckpointCoordinatorState> owner = checkpointCoordinatorFuture;
                 idFuture =
                         CompletableFuture.supplyAsync(
                                 () -> {
@@ -1166,6 +1224,7 @@ public class CheckpointCoordinator {
                                         return checkpointIdCounter.getAndIncrement();
                                     } catch (Throwable e) {
                                         handleCoordinatorError(
+                                                owner,
                                                 "get checkpoint id failed",
                                                 e,
                                                 CheckpointCloseReason.CHECKPOINT_INSIDE_ERROR);
